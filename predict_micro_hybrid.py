@@ -79,7 +79,8 @@ df_fx = pd.read_csv('forex-data.csv')
 df_fx = df_fx[df_fx['日付'] != '日付'].dropna(subset=['日付'])
 df_fx['Date'] = pd.to_datetime(df_fx['日付'], format='%y/%m/%d')
 df_fx['USD_JPY'] = pd.to_numeric(df_fx['終値'], errors='coerce')
-df_fx['USD_JPY_Return'] = df_fx['USD_JPY'].pct_change(-1)
+df_fx = df_fx.sort_values('Date') # 昇順ソートを追加
+df_fx['USD_JPY_Return'] = df_fx['USD_JPY'].pct_change(1) # -1 (未来のカンニング) から 1 (過去の実績) へ修正
 
 df = pd.merge(df, df_fx[['Date', 'USD_JPY', 'USD_JPY_Return']], on='Date', how='left')
 df['USD_JPY'].ffill(inplace=True)
@@ -90,7 +91,8 @@ df['USD_JPY_Return'].fillna(0, inplace=True)
 targets = ['Open', 'High', 'Low', 'Close']
 for t in targets:
     for i in range(1, 6):
-        df[f'Target_{t}_{i}d'] = df[t].shift(-i)
+        # 絶対価格ではなく「現在の終値からのリターン（乖離率）」をターゲットにする
+        df[f'Target_{t}_{i}d'] = (df[t].shift(-i) - df['Close']) / df['Close']
 
 df_all = df.copy() # ここでdropnaしない。最新の推論用データが消えるため。
 
@@ -122,6 +124,7 @@ base_data = df_base.iloc[-1].copy()
 base_data.ffill(inplace=True)
 base_data = base_data.fillna(0)
 X_base = pd.DataFrame([base_data[features]])
+current_close = base_data['Close']
 
 predictions_ohlc = {
     'Date': [],
@@ -143,10 +146,16 @@ for d in next_days:
     predictions_ohlc['Date'].append(d.strftime('%Y-%m-%d'))
 
 for i in range(1, 6):
-    pred_open = models[f'Open_{i}d'].predict(X_base)[0]
-    pred_high = models[f'High_{i}d'].predict(X_base)[0]
-    pred_low = models[f'Low_{i}d'].predict(X_base)[0]
-    pred_close = models[f'Close_{i}d'].predict(X_base)[0]
+    pred_open_return = models[f'Open_{i}d'].predict(X_base)[0]
+    pred_high_return = models[f'High_{i}d'].predict(X_base)[0]
+    pred_low_return = models[f'Low_{i}d'].predict(X_base)[0]
+    pred_close_return = models[f'Close_{i}d'].predict(X_base)[0]
+    
+    # リターンから絶対価格に復元
+    pred_open = current_close * (1 + pred_open_return)
+    pred_high = current_close * (1 + pred_high_return)
+    pred_low = current_close * (1 + pred_low_return)
+    pred_close = current_close * (1 + pred_close_return)
     
     # 論理的整合性（Low <= Open/Close <= High）を強制的に補正する
     actual_high = max(pred_high, pred_open, pred_close, pred_low)
