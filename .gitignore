@@ -1,1 +1,21 @@
 .DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+.venv/
+venv/
+env/
+ENV/
+
+# Output files
+trading_data_visualization.html
+*.csv
+*.xls
+*.xlsx
+
+# uv tool
+uv.lock
