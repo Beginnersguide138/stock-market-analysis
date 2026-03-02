@@ -110,21 +110,32 @@ df_train = df_all[df_all['Date'] < test_date_start].dropna(subset=targets).reset
 # ==========================================
 print("\n=== 時系列K-Fold CVによるXGBoost(単体)のOHLC独立評価 ===")
 tscv = TimeSeriesSplit(n_splits=3)
-X = df_train[features]
 
-for t in targets:
-    y = df_train[t]
-    rmses = []
-    for train_idx, val_idx in tscv.split(X):
-        X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
-        y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
+for i in range(1, 6):
+    print(f"\n--- {i}日先 (Target {i}d) の予測精度 ---")
+    for t in targets:
+        target_col = f'{t}_{i}d'
+        base_col = t.replace('Target_', '').replace('_Return', '')
         
-        model = xgb.XGBRegressor(n_estimators=100, max_depth=3, learning_rate=0.05, random_state=42, n_jobs=-1)
-        model.fit(X_tr, y_tr)
-        preds = model.predict(X_val)
-        rmse = np.sqrt(mean_squared_error(y_val, preds))
-        rmses.append(rmse)
-    print(f"[{t}] CV RMSE: {np.mean(rmses):.4f}")
+        # 評価用の一時的なターゲットを作成
+        df_cv = df_train.copy()
+        df_cv[target_col] = (df_cv[base_col].shift(-i) - df_cv['Close']) / df_cv['Close']
+        df_cv = df_cv.dropna(subset=[target_col])
+        
+        X_cv = df_cv[features]
+        y_cv = df_cv[target_col]
+        
+        rmses = []
+        for train_idx, val_idx in tscv.split(X_cv):
+            X_tr, X_val = X_cv.iloc[train_idx], X_cv.iloc[val_idx]
+            y_tr, y_val = y_cv.iloc[train_idx], y_cv.iloc[val_idx]
+            
+            model = xgb.XGBRegressor(n_estimators=100, max_depth=3, learning_rate=0.05, random_state=42, n_jobs=-1)
+            model.fit(X_tr, y_tr)
+            preds = model.predict(X_val)
+            rmse = np.sqrt(mean_squared_error(y_val, preds))
+            rmses.append(rmse)
+        print(f"[{t}] CV RMSE: {np.mean(rmses):.4f}")
 
 # ==========================================
 # 7. 全データで最終学習
@@ -160,7 +171,17 @@ base_date = base_data['Date']
 current_close = base_data['Close']
 current_features = {f: base_data[f] for f in features}
 
-current_ema12 = df_all[df_all['Date'] < test_date_start]['Close'].ewm(span=12, adjust=False).mean().iloc[-1]
+# 各種指標の初期化（ループ前）
+hist_close = df_all[df_all['Date'] < test_date_start]['Close']
+current_ema12 = hist_close.ewm(span=12, adjust=False).mean().iloc[-1]
+
+diff = hist_close.diff()
+up = diff.where(diff > 0, 0)
+down = -diff.where(diff < 0, 0)
+current_avg_gain = up.ewm(alpha=1/14, adjust=False).mean().iloc[-1]
+current_avg_loss = down.ewm(alpha=1/14, adjust=False).mean().iloc[-1]
+
+stoch_k_list = df_all[df_all['Date'] < test_date_start]['Stoch_K'].tail(2).tolist()
 
 next_days = []
 tmp_date = base_date
@@ -205,22 +226,23 @@ for i, d in enumerate(next_days):
     current_features['High_Low_Spread'] = (actual_high - actual_low) / actual_low
     current_features['Open_Close_Spread'] = (p_close - p_open) / p_open
     
-    raw_closes.append(p_close); raw_closes.pop(0)
-    raw_highs.append(actual_high); raw_highs.pop(0)
-    raw_lows.append(actual_low); raw_lows.pop(0)
-    
-    changes = np.diff(raw_closes[-15:])
-    gains = np.where(changes > 0, changes, 0)
-    losses = np.where(changes < 0, -changes, 0)
-    avg_gain = np.mean(gains)
-    avg_loss = np.mean(losses)
-    if avg_loss == 0:
-        rs = 100
+    # RSIの正確な更新 (Wilder平滑化)
+    change = p_close - raw_closes[-1]
+    gain = max(change, 0)
+    loss = max(-change, 0)
+    current_avg_gain = (current_avg_gain * 13 + gain) / 14
+    current_avg_loss = (current_avg_loss * 13 + loss) / 14
+    if current_avg_loss == 0:
         rsi = 100
     else:
-        rs = avg_gain / avg_loss
+        rs = current_avg_gain / current_avg_loss
         rsi = 100 - (100 / (1 + rs))
     current_features['RSI'] = rsi
+    
+    raw_closes.append(p_close); raw_closes.pop(0)
+    
+    raw_highs.append(actual_high); raw_highs.pop(0)
+    raw_lows.append(actual_low); raw_lows.pop(0)
     
     recent_14_high = max(raw_highs[-14:])
     recent_14_low = min(raw_lows[-14:])
@@ -229,7 +251,11 @@ for i, d in enumerate(next_days):
     else:
         stoch_k = 100 * (p_close - recent_14_low) / (recent_14_high - recent_14_low)
     current_features['Stoch_K'] = stoch_k
-    current_features['Stoch_D'] = current_features['Stoch_D'] * 0.6 + stoch_k * 0.4
+    
+    # Stochastic D は3日間のSMA
+    stoch_k_list.append(stoch_k)
+    stoch_k_list.pop(0)
+    current_features['Stoch_D'] = np.mean(stoch_k_list)
     
     alpha = 2 / (12 + 1)
     new_ema12 = (p_close - current_ema12) * alpha + current_ema12
