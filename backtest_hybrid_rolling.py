@@ -11,9 +11,14 @@ warnings.filterwarnings('ignore')
 from tqdm import tqdm
 from joblib import Parallel, delayed
 
+import sys
+
+# 銘柄コードをコマンドライン引数から取得（デフォルトは4443.T）
+ticker = sys.argv[1] if len(sys.argv) > 1 else '4443.T'
+
 # 1. データの取得
-print("Fetching daily data for 6723.T (Renesas), ^DJI (Dow Jones), and ^N225 (Nikkei 225) from Yahoo Finance...")
-df_target = yf.download('6723.T', period='10y')
+print(f"Fetching daily data for {ticker}, ^DJI (Dow Jones), and ^N225 (Nikkei 225) from Yahoo Finance...")
+df_target = yf.download(ticker, period='10y')
 df_dji = yf.download('^DJI', period='10y')
 df_n225 = yf.download('^N225', period='10y')
 
@@ -252,6 +257,10 @@ if not df_preds.empty:
 fig.add_vline(x=pd.to_datetime('2026-02-04').timestamp() * 1000, line_dash="dot", line_color="orange")
 fig.add_annotation(x='2026-02-04', y=1500, text="2/4 大暴落", showarrow=True, arrowhead=1)
 
+from datetime import datetime
+
+# ... (既存のコード) ...
+
 fig.update_layout(
     title='【完全版・ダイレクト予測モデル】 直近1ヶ月ローリング・バックテスト',
     yaxis_title='株価 (円)',
@@ -259,6 +268,10 @@ fig.update_layout(
     height=800, width=1200, template='plotly_white'
 )
 
-output_html = "backtest_direct_hybrid_chart.html"
+# 実行時のタイムスタンプを付与してファイル名を動的に生成
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+ticker_clean = ticker.replace('.T', '')
+output_html = f"backtest_{ticker_clean}_{timestamp}.html"
+
 fig.write_html(output_html)
 print(f"\n=> チャートを {output_html} に保存しました。")
