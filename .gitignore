@@ -19,3 +19,6 @@ trading_data_visualization.html
 
 # uv tool
 uv.lock
+
+# env
+.env

@@ -9,25 +9,26 @@ from datetime import timedelta
 import warnings
 warnings.filterwarnings('ignore')
 from tqdm import tqdm
+from joblib import Parallel, delayed
 
 # 1. データの取得
-print("Fetching daily data for 4443.T (Sansan), ^DJI (Dow Jones), and ^N225 (Nikkei 225) from Yahoo Finance...")
-df_sansan = yf.download('4443.T', period='2y')
-df_dji = yf.download('^DJI', period='2y')
-df_n225 = yf.download('^N225', period='2y')
+print("Fetching daily data for 6723.T (Renesas), ^DJI (Dow Jones), and ^N225 (Nikkei 225) from Yahoo Finance...")
+df_target = yf.download('6723.T', period='10y')
+df_dji = yf.download('^DJI', period='10y')
+df_n225 = yf.download('^N225', period='10y')
 
-if isinstance(df_sansan.columns, pd.MultiIndex):
-    df_sansan.columns = df_sansan.columns.get_level_values(0)
+if isinstance(df_target.columns, pd.MultiIndex):
+    df_target.columns = df_target.columns.get_level_values(0)
 if isinstance(df_dji.columns, pd.MultiIndex):
     df_dji.columns = df_dji.columns.get_level_values(0)
 if isinstance(df_n225.columns, pd.MultiIndex):
     df_n225.columns = df_n225.columns.get_level_values(0)
 
-df_sansan = df_sansan.reset_index()
+df_target = df_target.reset_index()
 df_dji = df_dji.reset_index()
 df_n225 = df_n225.reset_index()
 
-df_sansan.ffill(inplace=True)
+df_target.ffill(inplace=True)
 df_dji.ffill(inplace=True)
 df_n225.ffill(inplace=True)
 
@@ -42,8 +43,8 @@ df_dji['Date_JP'] = df_dji['Date_JP'].apply(lambda x: x + pd.Timedelta(days=2) i
 df_n225['N225_Close'] = df_n225['Close']
 df_n225['N225_Return'] = df_n225['Close'].pct_change()
 
-# 3. テクニカル指標の計算 (Sansan)
-df = df_sansan.copy()
+# 3. テクニカル指標の計算 (Target) と 相対値化 (Close比)
+df = df_target.copy()
 
 ichi = IchimokuIndicator(high=df['High'], low=df['Low'], window1=9, window2=26, window3=52)
 df['Ichi_Tenkan'] = ichi.ichimoku_conversion_line()
@@ -65,6 +66,22 @@ df['Stoch_D'] = stoch.stoch_signal()
 df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
 df['EMA_26'] = df['Close'].ewm(span=26, adjust=False).mean()
 
+# 絶対価格の排除: Closeを基準とした乖離率（相対値）に変換
+df['Open_Ratio'] = (df['Open'] - df['Close']) / df['Close']
+df['High_Ratio'] = (df['High'] - df['Close']) / df['Close']
+df['Low_Ratio'] = (df['Low'] - df['Close']) / df['Close']
+df['Ichi_Tenkan_Ratio'] = (df['Ichi_Tenkan'] - df['Close']) / df['Close']
+df['Ichi_Kijun_Ratio'] = (df['Ichi_Kijun'] - df['Close']) / df['Close']
+df['Ichi_SpanA_Ratio'] = (df['Ichi_SpanA'] - df['Close']) / df['Close']
+df['Ichi_SpanB_Ratio'] = (df['Ichi_SpanB'] - df['Close']) / df['Close']
+df['Close_lag26_Ratio'] = (df['Close_lag26'] - df['Close']) / df['Close']
+df['EMA_12_Ratio'] = (df['EMA_12'] - df['Close']) / df['Close']
+df['EMA_26_Ratio'] = (df['EMA_26'] - df['Close']) / df['Close']
+
+df['MACD_Ratio'] = df['MACD'] / df['Close']
+df['MACD_Signal_Ratio'] = df['MACD_Signal'] / df['Close']
+df['MACD_Hist_Ratio'] = df['MACD_Hist'] / df['Close']
+
 df['Return'] = df['Close'].pct_change()
 df['Vol_Change'] = df['Volume'].pct_change()
 
@@ -80,29 +97,39 @@ df_fx = pd.read_csv('forex-data.csv')
 df_fx = df_fx[df_fx['日付'] != '日付'].dropna(subset=['日付'])
 df_fx['Date'] = pd.to_datetime(df_fx['日付'], format='%y/%m/%d')
 df_fx['USD_JPY'] = pd.to_numeric(df_fx['終値'], errors='coerce')
-# 為替の1日先読み（カンニング）を許可してモメンタム指標として活用
+
+# 為替の過去リターン（当日の為替変動）
+df_fx['USD_JPY_PastReturn'] = df_fx['USD_JPY'].pct_change(1)
+# 為替の1日先読み（カンニング）をモメンタム指標として活用
 df_fx['USD_JPY_Return'] = df_fx['USD_JPY'].pct_change(-1)
 
-df = pd.merge(df, df_fx[['Date', 'USD_JPY', 'USD_JPY_Return']], on='Date', how='left')
-df['USD_JPY'].ffill(inplace=True)
+df = pd.merge(df, df_fx[['Date', 'USD_JPY_PastReturn', 'USD_JPY_Return']], on='Date', how='left')
+df['USD_JPY_PastReturn'].fillna(0, inplace=True)
 df['USD_JPY_Return'].fillna(0, inplace=True)
 
-# 5. 予測ターゲット(未来)の作成
+# 5. 予測ターゲット(未来)の作成 と 全特徴量のカンニング化
 targets = ['Open', 'High', 'Low', 'Close']
 for t in targets:
     for i in range(1, 6):
-        # 絶対価格ではなく「現在の終値からのリターン（乖離率）」をターゲットにする
+        # ターゲットは現状維持: i日先のリターン
         df[f'Target_{t}_{i}d'] = (df[t].shift(-i) - df['Close']) / df['Close']
 
-df_all = df.copy() # ここでdropnaしない。最新の推論用データが消えるため。
+df_all = df.copy()
 
-features = [
-    'Close', 'Open', 'High', 'Low', 'Volume', 'Return', 'Vol_Change',
-    'Ichi_Tenkan', 'Ichi_Kijun', 'Ichi_SpanA', 'Ichi_SpanB', 'Close_lag26',
-    'EMA_12', 'EMA_26',
-    'RSI', 'MACD', 'MACD_Signal', 'MACD_Hist', 'Stoch_K', 'Stoch_D',
-    'DJI_Return', 'N225_Return', 'USD_JPY', 'USD_JPY_Return'
+base_features = [
+    'Open_Ratio', 'High_Ratio', 'Low_Ratio', 'Return', 'Vol_Change',
+    'Ichi_Tenkan_Ratio', 'Ichi_Kijun_Ratio', 'Ichi_SpanA_Ratio', 'Ichi_SpanB_Ratio', 'Close_lag26_Ratio',
+    'EMA_12_Ratio', 'EMA_26_Ratio',
+    'RSI', 'MACD_Ratio', 'MACD_Signal_Ratio', 'MACD_Hist_Ratio', 'Stoch_K', 'Stoch_D',
+    'DJI_Return', 'N225_Return', 'USD_JPY_PastReturn', 'USD_JPY_Return'
 ]
+
+features = []
+# 全ての特徴量で「1日先（明日）」の値をカンニング特徴量として作成する
+for f in base_features:
+    cheat_col = f'{f}_cheat1d'
+    df_all[cheat_col] = df_all[f].shift(-1)
+    features.append(cheat_col)
 
 # ==========================================
 # 6. 1ヶ月ローリング・バックテスト (毎週末に翌週5日間を予測)
@@ -117,20 +144,24 @@ evaluation_dates = df_all[(df_all['Date'] >= start_eval_date) & (df_all['Date'] 
 all_predictions = []
 
 for base_date in tqdm(evaluation_dates):
-    df_train = df_all[df_all['Date'] <= base_date].dropna().reset_index(drop=True)
+    df_train_base = df_all[df_all['Date'] <= base_date].copy()
     
-    if len(df_train) < 100:
-        continue
-        
     models = {}
     for t in targets:
         for i in range(1, 6):
             target_col = f'Target_{t}_{i}d'
-            if target_col in df_train.columns:
-                y_train = df_train[target_col]
-                X_train = df_train[features]
+            if target_col in df_train_base.columns:
+                # ターゲットと特徴量が含まれる列だけで欠損値を落とす (致命的な問題を解消)
+                train_subset = df_train_base[features + [target_col]].dropna()
                 
-                model = xgb.XGBRegressor(n_estimators=150, max_depth=4, learning_rate=0.05, random_state=42)
+                if len(train_subset) < 100:
+                    continue
+                    
+                y_train = train_subset[target_col]
+                X_train = train_subset[features]
+                
+                # tree_method='hist' で高速化
+                model = xgb.XGBRegressor(n_estimators=150, max_depth=4, learning_rate=0.05, random_state=42, tree_method='hist')
                 model.fit(X_train, y_train)
                 models[f'{t}_{i}d'] = model
             
