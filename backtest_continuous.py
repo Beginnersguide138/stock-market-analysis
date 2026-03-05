@@ -25,9 +25,7 @@ df_sansan = df_sansan.reset_index()
 df_dji = df_dji.reset_index()
 df_n225 = df_n225.reset_index()
 
-df_sansan.ffill(inplace=True)
-df_dji.ffill(inplace=True)
-df_n225.ffill(inplace=True)
+# Note: ffill deferred to after train/test split to prevent data leakage
 
 # 2. 指数・為替の特徴量作成
 df_dji['DJI_Close'] = df_dji['Close']
@@ -38,38 +36,44 @@ df_dji['Date_JP'] = df_dji['Date_JP'].apply(lambda x: x + pd.Timedelta(days=2) i
 df_n225['N225_Close'] = df_n225['Close']
 df_n225['N225_Return'] = df_n225['Close'].pct_change()
 
-# 3. テクニカル指標の計算 (Sansan)
-df = df_sansan.copy()
+# 3. テクニカル指標の計算関数 (データリーク防止: 必要な範囲のみで計算)
+def compute_features(df_input):
+    """テクニカル指標を計算する。入力dfのコピーに対して計算を行う。"""
+    df_out = df_input.copy()
 
-ichi = IchimokuIndicator(high=df['High'], low=df['Low'], window1=9, window2=26, window3=52)
-df['Ichi_Tenkan'] = ichi.ichimoku_conversion_line()
-df['Ichi_Kijun'] = ichi.ichimoku_base_line()
-df['Ichi_SpanA'] = ichi.ichimoku_a()
-df['Ichi_SpanB'] = ichi.ichimoku_b()
-df['Close_lag26'] = df['Close'].shift(26)
+    ichi = IchimokuIndicator(high=df_out['High'], low=df_out['Low'], window1=9, window2=26, window3=52)
+    df_out['Ichi_Tenkan'] = ichi.ichimoku_conversion_line()
+    df_out['Ichi_Kijun'] = ichi.ichimoku_base_line()
+    df_out['Ichi_SpanA'] = ichi.ichimoku_a()
+    df_out['Ichi_SpanB'] = ichi.ichimoku_b()
+    df_out['Close_lag26'] = df_out['Close'].shift(26)
 
-df['RSI'] = RSIIndicator(close=df['Close'], window=14).rsi()
-macd = MACD(close=df['Close'])
-df['MACD'] = macd.macd()
-df['MACD_Signal'] = macd.macd_signal()
-df['MACD_Hist'] = macd.macd_diff()
+    df_out['RSI'] = RSIIndicator(close=df_out['Close'], window=14).rsi()
+    macd = MACD(close=df_out['Close'])
+    df_out['MACD'] = macd.macd()
+    df_out['MACD_Signal'] = macd.macd_signal()
+    df_out['MACD_Hist'] = macd.macd_diff()
 
-stoch = StochasticOscillator(high=df['High'], low=df['Low'], close=df['Close'], window=14, smooth_window=3)
-df['Stoch_K'] = stoch.stoch()
-df['Stoch_D'] = stoch.stoch_signal()
+    stoch = StochasticOscillator(high=df_out['High'], low=df_out['Low'], close=df_out['Close'], window=14, smooth_window=3)
+    df_out['Stoch_K'] = stoch.stoch()
+    df_out['Stoch_D'] = stoch.stoch_signal()
 
-df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
-df['EMA_26'] = df['Close'].ewm(span=26, adjust=False).mean()
+    df_out['EMA_12'] = df_out['Close'].ewm(span=12, adjust=False).mean()
+    df_out['EMA_26'] = df_out['Close'].ewm(span=26, adjust=False).mean()
 
-df['Return'] = df['Close'].pct_change()
-df['Vol_Change'] = df['Volume'].pct_change()
+    df_out['Return'] = df_out['Close'].pct_change()
+    df_out['Vol_Change'] = df_out['Volume'].pct_change()
 
-# 4. データ結合
-df = pd.merge(df, df_dji[['Date_JP', 'DJI_Close', 'DJI_Return']], left_on='Date', right_on='Date_JP', how='left')
-df['DJI_Return'] = df['DJI_Return'].fillna(0)
+    return df_out
 
-df = pd.merge(df, df_n225[['Date', 'N225_Close', 'N225_Return']], on='Date', how='left')
-df['N225_Return'] = df['N225_Return'].fillna(0)
+# 4. データ結合 (外部データのmergeは生データに対して行う - テクニカル指標はループ内で計算)
+df_raw = df_sansan.copy()
+
+df_raw = pd.merge(df_raw, df_dji[['Date_JP', 'DJI_Close', 'DJI_Return']], left_on='Date', right_on='Date_JP', how='left')
+df_raw['DJI_Return'] = df_raw['DJI_Return'].fillna(0)
+
+df_raw = pd.merge(df_raw, df_n225[['Date', 'N225_Close', 'N225_Return']], on='Date', how='left')
+df_raw['N225_Return'] = df_raw['N225_Return'].fillna(0)
 
 df_fx = pd.read_csv('forex-data.csv')
 df_fx = df_fx[df_fx['日付'] != '日付'].dropna(subset=['日付'])
@@ -77,17 +81,15 @@ df_fx['Date'] = pd.to_datetime(df_fx['日付'], format='%y/%m/%d')
 df_fx['USD_JPY'] = pd.to_numeric(df_fx['終値'], errors='coerce')
 df_fx['USD_JPY_Return'] = df_fx['USD_JPY'].pct_change(-1)
 
-df = pd.merge(df, df_fx[['Date', 'USD_JPY', 'USD_JPY_Return']], on='Date', how='left')
-df['USD_JPY'].ffill(inplace=True)
-df['USD_JPY_Return'].fillna(0, inplace=True)
+df_raw = pd.merge(df_raw, df_fx[['Date', 'USD_JPY', 'USD_JPY_Return']], on='Date', how='left')
+# Note: USD_JPY ffill deferred to after train/test split
+df_raw['USD_JPY_Return'].fillna(0, inplace=True)
 
 # 5. 特徴量とターゲットの作成
 targets = ['Close'] # 方向性だけを見るためCloseのみでOK
 for t in targets:
     for i in range(1, 6):
-        df[f'Target_{t}_{i}d'] = df[t].shift(-i)
-
-df_all = df.copy()
+        df_raw[f'Target_{t}_{i}d'] = df_raw[t].shift(-i)
 
 features = [
     'Close', 'Open', 'High', 'Low', 'Volume', 'Return', 'Vol_Change',
@@ -106,11 +108,19 @@ total_predictions = 0
 print("\n=== 波形（上下方向）の連続バックテスト検証 ===")
 
 for base_date_str in test_base_dates:
-    test_date_start = pd.to_datetime(base_date_str) + pd.Timedelta(days=1)
-    
-    # 基準日までのデータで学習
-    df_train = df_all[df_all['Date'] < test_date_start].dropna().reset_index(drop=True)
-    
+    base_date_dt = pd.to_datetime(base_date_str)
+
+    # データリーク防止: 基準日 + 予測horizon分までの生データのみでテクニカル指標を計算
+    cutoff_date = base_date_dt + timedelta(days=10)  # 5営業日分のバッファ
+    df_cutoff = df_raw[df_raw['Date'] <= cutoff_date].copy()
+    df_iter = compute_features(df_cutoff)
+
+    # 基準日までのデータで学習 (1-day gap to prevent leakage)
+    gap = pd.Timedelta(days=1)
+    df_train = df_iter[df_iter['Date'] <= base_date_dt - gap].copy()
+    df_train.ffill(inplace=True)
+    df_train = df_train.dropna().reset_index(drop=True)
+
     models = {}
     for i in range(1, 6):
         y = df_train[f'Target_Close_{i}d']
@@ -119,8 +129,7 @@ for base_date_str in test_base_dates:
         models[f'{i}d'] = model
 
     # 基準日時点のデータを取得
-    df_base = df_all[df_all['Date'] <= pd.to_datetime(base_date_str)]
-    base_data = df_base.iloc[-1].copy()
+    base_data = df_iter[df_iter['Date'] <= base_date_dt].iloc[-1].copy()
     base_data.ffill(inplace=True)
     base_data = base_data.fillna(0)
     X_base = pd.DataFrame([base_data[features]])
@@ -155,7 +164,7 @@ for base_date_str in test_base_dates:
     
     for i, d in enumerate(next_days):
         d_str = d.strftime('%Y-%m-%d')
-        actual = df_all[df_all['Date'] == d_str]
+        actual = df_iter[df_iter['Date'] == d_str]
         
         if not actual.empty:
             a_close = actual['Close'].values[0]

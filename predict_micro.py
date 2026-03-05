@@ -23,7 +23,7 @@ if isinstance(df_dji.columns, pd.MultiIndex):
 df_sansan = df_sansan.reset_index()
 df_dji = df_dji.reset_index()
 
-# 欠損値補完
+# Note: ffill applied before split for simplicity; minimal leakage risk for forward-fill
 df_sansan.ffill(inplace=True)
 df_dji.ffill(inplace=True)
 
@@ -39,31 +39,34 @@ df_dji['Date_JP'] = df_dji['Date'] + pd.Timedelta(days=1)
 df_dji['Date_JP'] = df_dji['Date_JP'].apply(lambda x: x + pd.Timedelta(days=2) if x.weekday() == 5 else (x + pd.Timedelta(days=1) if x.weekday() == 6 else x))
 
 # 3. テクニカル指標の計算 (Sansan)
-df = df_sansan.copy()
+def compute_technical_features(df_input):
+    """Compute technical indicators on the given dataframe to avoid data leakage.
+    Must be called on training data only (not on the full dataset before splitting)."""
+    df_out = df_input.copy()
+    ichi = IchimokuIndicator(high=df_out['High'], low=df_out['Low'], window1=9, window2=26, window3=52)
+    df_out['Ichi_Tenkan'] = ichi.ichimoku_conversion_line()
+    df_out['Ichi_Kijun'] = ichi.ichimoku_base_line()
+    df_out['Ichi_SpanA'] = ichi.ichimoku_a()
+    df_out['Ichi_SpanB'] = ichi.ichimoku_b()
+    df_out['Close_lag26'] = df_out['Close'].shift(26)
+    df_out['RSI'] = RSIIndicator(close=df_out['Close'], window=14).rsi()
+    macd = MACD(close=df_out['Close'])
+    df_out['MACD'] = macd.macd()
+    df_out['MACD_Signal'] = macd.macd_signal()
+    df_out['MACD_Hist'] = macd.macd_diff()
+    stoch = StochasticOscillator(high=df_out['High'], low=df_out['Low'], close=df_out['Close'], window=14, smooth_window=3)
+    df_out['Stoch_K'] = stoch.stoch()
+    df_out['Stoch_D'] = stoch.stoch_signal()
+    df_out['Return'] = df_out['Close'].pct_change()
+    df_out['Vol_Change'] = df_out['Volume'].pct_change()
+    return df_out
 
-# 一目均衡表
-ichi = IchimokuIndicator(high=df['High'], low=df['Low'], window1=9, window2=26, window3=52)
-df['Ichi_Tenkan'] = ichi.ichimoku_conversion_line()
-df['Ichi_Kijun'] = ichi.ichimoku_base_line()
-df['Ichi_SpanA'] = ichi.ichimoku_a()
-df['Ichi_SpanB'] = ichi.ichimoku_b()
-# 遅行スパンは過去の終値なのでここではラグ特徴量として扱う
-df['Ichi_Chikou'] = df['Close'].shift(-26) # 本来の遅行スパンは未来にずらすが、機械学習では現在のCloseと過去のClose比較で代用
-df['Close_lag26'] = df['Close'].shift(26)
-
-# オシレーター
-df['RSI'] = RSIIndicator(close=df['Close'], window=14).rsi()
-macd = MACD(close=df['Close'])
-df['MACD'] = macd.macd()
-df['MACD_Signal'] = macd.macd_signal()
-df['MACD_Hist'] = macd.macd_diff()
-
-stoch = StochasticOscillator(high=df['High'], low=df['Low'], close=df['Close'], window=14, smooth_window=3)
-df['Stoch_K'] = stoch.stoch()
-df['Stoch_D'] = stoch.stoch_signal()
-
-df['Return'] = df['Close'].pct_change()
-df['Vol_Change'] = df['Volume'].pct_change()
+# NOTE: For the main training path, this script trains on all available data and predicts
+# the next unseen point (no train/test split). Technical indicators used here (Ichimoku,
+# RSI, MACD, Stochastic) are backward-looking per row, so computing on the full dataset
+# does not leak future OHLCV values into any given row's features. The CV section below
+# recomputes features per fold to properly avoid leakage during evaluation.
+df = compute_technical_features(df_sansan)
 
 # 4. データ結合
 df = pd.merge(df, df_dji[['Date_JP', 'DJI_Close', 'DJI_Return']], left_on='Date', right_on='Date_JP', how='left')
@@ -178,3 +181,60 @@ fig.update_layout(title="Sansan (4443) テクニカル指標と来週の株価�
 
 fig.write_html("micro_forecast.html")
 print("\nVisualization saved to micro_forecast.html")
+
+# --- Cross Validation with TimeSeriesSplit ---
+# NOTE: Features are recomputed per fold on training data only to avoid data leakage.
+# The raw OHLCV data (df_sansan + DJI merge) is split first, then indicators are computed.
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+print("\n=== TimeSeriesSplit Cross-Validation (5-fold) ===")
+tscv = TimeSeriesSplit(n_splits=5)
+
+# Prepare raw data with DJI merge but without technical indicators for CV
+df_raw_cv = df_sansan.copy()
+df_raw_cv = pd.merge(df_raw_cv, df_dji[['Date_JP', 'DJI_Close', 'DJI_Return']], left_on='Date', right_on='Date_JP', how='left')
+df_raw_cv['DJI_Return'] = df_raw_cv['DJI_Return'].fillna(0)
+df_raw_cv = df_raw_cv.dropna(subset=['Close']).reset_index(drop=True)
+
+target_cols = [f'Target_Close_{i}d' for i in range(1, 6)]
+for target_col_name in target_cols:
+    i_days = int(target_col_name.split('_')[-1].replace('d', ''))
+    mae_scores = []
+    rmse_scores = []
+    indices = np.arange(len(df_raw_cv))
+    for fold, (train_idx, val_idx) in enumerate(tscv.split(indices), 1):
+        # Recompute features on training portion only (with buffer for indicator warmup)
+        BUFFER = 60  # enough for Ichimoku(52) and other indicators
+        buffer_start = max(0, train_idx[0] - BUFFER)
+        train_with_buffer = df_raw_cv.iloc[buffer_start:train_idx[-1]+1]
+        train_featured = compute_technical_features(train_with_buffer)
+        train_featured[target_col_name] = train_featured['Close'].shift(-i_days)
+        train_featured = train_featured.dropna(subset=features + [target_col_name])
+        # Only use rows that are in the actual train_idx range (drop buffer rows)
+        actual_train_start = len(train_with_buffer) - len(train_idx)
+        if actual_train_start > 0:
+            train_featured = train_featured.iloc[actual_train_start:]
+        X_t = train_featured[features]
+        y_t = train_featured[target_col_name]
+
+        # Recompute features for validation portion (use training + val data, take val rows)
+        val_with_buffer = df_raw_cv.iloc[buffer_start:val_idx[-1]+1]
+        val_featured = compute_technical_features(val_with_buffer)
+        val_featured[target_col_name] = val_featured['Close'].shift(-i_days)
+        val_featured = val_featured.dropna(subset=features + [target_col_name])
+        # Only take rows corresponding to val_idx
+        val_featured = val_featured.iloc[-(len(val_idx)):]
+        val_featured = val_featured.dropna(subset=features + [target_col_name])
+        if len(val_featured) == 0 or len(X_t) == 0:
+            continue
+        X_v = val_featured[features]
+        y_v = val_featured[target_col_name]
+
+        model_cv = xgb.XGBRegressor(n_estimators=150, max_depth=4, learning_rate=0.05, random_state=42)
+        model_cv.fit(X_t, y_t)
+        pred = model_cv.predict(X_v)
+        mae_scores.append(mean_absolute_error(y_v, pred))
+        rmse_scores.append(np.sqrt(mean_squared_error(y_v, pred)))
+        print(f"  {target_col_name} Fold {fold}: MAE={mae_scores[-1]:.4f}, RMSE={rmse_scores[-1]:.4f}")
+    print(f"  {target_col_name} Avg MAE: {np.mean(mae_scores):.4f}, Avg RMSE: {np.mean(rmse_scores):.4f}")

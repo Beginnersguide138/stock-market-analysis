@@ -33,9 +33,7 @@ df_target = df_target.reset_index()
 df_dji = df_dji.reset_index()
 df_n225 = df_n225.reset_index()
 
-df_target.ffill(inplace=True)
-df_dji.ffill(inplace=True)
-df_n225.ffill(inplace=True)
+# Note: ffill deferred to after train/test split to prevent data leakage
 
 # 2. 指数・為替の特徴量作成
 # ダウ (前日)
@@ -48,54 +46,60 @@ df_dji['Date_JP'] = df_dji['Date_JP'].apply(lambda x: x + pd.Timedelta(days=2) i
 df_n225['N225_Close'] = df_n225['Close']
 df_n225['N225_Return'] = df_n225['Close'].pct_change()
 
-# 3. テクニカル指標の計算 (Target) と 相対値化 (Close比)
-df = df_target.copy()
+# 3. テクニカル指標の計算関数 (データリーク防止: 必要な範囲のみで計算)
+def compute_features(df_input):
+    """テクニカル指標を計算し、相対値化する。入力dfのコピーに対して計算を行う。"""
+    df_out = df_input.copy()
 
-ichi = IchimokuIndicator(high=df['High'], low=df['Low'], window1=9, window2=26, window3=52)
-df['Ichi_Tenkan'] = ichi.ichimoku_conversion_line()
-df['Ichi_Kijun'] = ichi.ichimoku_base_line()
-df['Ichi_SpanA'] = ichi.ichimoku_a()
-df['Ichi_SpanB'] = ichi.ichimoku_b()
-df['Close_lag26'] = df['Close'].shift(26)
+    ichi = IchimokuIndicator(high=df_out['High'], low=df_out['Low'], window1=9, window2=26, window3=52)
+    df_out['Ichi_Tenkan'] = ichi.ichimoku_conversion_line()
+    df_out['Ichi_Kijun'] = ichi.ichimoku_base_line()
+    df_out['Ichi_SpanA'] = ichi.ichimoku_a()
+    df_out['Ichi_SpanB'] = ichi.ichimoku_b()
+    df_out['Close_lag26'] = df_out['Close'].shift(26)
 
-df['RSI'] = RSIIndicator(close=df['Close'], window=14).rsi()
-macd = MACD(close=df['Close'])
-df['MACD'] = macd.macd()
-df['MACD_Signal'] = macd.macd_signal()
-df['MACD_Hist'] = macd.macd_diff()
+    df_out['RSI'] = RSIIndicator(close=df_out['Close'], window=14).rsi()
+    macd = MACD(close=df_out['Close'])
+    df_out['MACD'] = macd.macd()
+    df_out['MACD_Signal'] = macd.macd_signal()
+    df_out['MACD_Hist'] = macd.macd_diff()
 
-stoch = StochasticOscillator(high=df['High'], low=df['Low'], close=df['Close'], window=14, smooth_window=3)
-df['Stoch_K'] = stoch.stoch()
-df['Stoch_D'] = stoch.stoch_signal()
+    stoch = StochasticOscillator(high=df_out['High'], low=df_out['Low'], close=df_out['Close'], window=14, smooth_window=3)
+    df_out['Stoch_K'] = stoch.stoch()
+    df_out['Stoch_D'] = stoch.stoch_signal()
 
-df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
-df['EMA_26'] = df['Close'].ewm(span=26, adjust=False).mean()
+    df_out['EMA_12'] = df_out['Close'].ewm(span=12, adjust=False).mean()
+    df_out['EMA_26'] = df_out['Close'].ewm(span=26, adjust=False).mean()
 
-# 絶対価格の排除: Closeを基準とした乖離率（相対値）に変換
-df['Open_Ratio'] = (df['Open'] - df['Close']) / df['Close']
-df['High_Ratio'] = (df['High'] - df['Close']) / df['Close']
-df['Low_Ratio'] = (df['Low'] - df['Close']) / df['Close']
-df['Ichi_Tenkan_Ratio'] = (df['Ichi_Tenkan'] - df['Close']) / df['Close']
-df['Ichi_Kijun_Ratio'] = (df['Ichi_Kijun'] - df['Close']) / df['Close']
-df['Ichi_SpanA_Ratio'] = (df['Ichi_SpanA'] - df['Close']) / df['Close']
-df['Ichi_SpanB_Ratio'] = (df['Ichi_SpanB'] - df['Close']) / df['Close']
-df['Close_lag26_Ratio'] = (df['Close_lag26'] - df['Close']) / df['Close']
-df['EMA_12_Ratio'] = (df['EMA_12'] - df['Close']) / df['Close']
-df['EMA_26_Ratio'] = (df['EMA_26'] - df['Close']) / df['Close']
+    # 絶対価格の排除: Closeを基準とした乖離率（相対値）に変換
+    df_out['Open_Ratio'] = (df_out['Open'] - df_out['Close']) / df_out['Close']
+    df_out['High_Ratio'] = (df_out['High'] - df_out['Close']) / df_out['Close']
+    df_out['Low_Ratio'] = (df_out['Low'] - df_out['Close']) / df_out['Close']
+    df_out['Ichi_Tenkan_Ratio'] = (df_out['Ichi_Tenkan'] - df_out['Close']) / df_out['Close']
+    df_out['Ichi_Kijun_Ratio'] = (df_out['Ichi_Kijun'] - df_out['Close']) / df_out['Close']
+    df_out['Ichi_SpanA_Ratio'] = (df_out['Ichi_SpanA'] - df_out['Close']) / df_out['Close']
+    df_out['Ichi_SpanB_Ratio'] = (df_out['Ichi_SpanB'] - df_out['Close']) / df_out['Close']
+    df_out['Close_lag26_Ratio'] = (df_out['Close_lag26'] - df_out['Close']) / df_out['Close']
+    df_out['EMA_12_Ratio'] = (df_out['EMA_12'] - df_out['Close']) / df_out['Close']
+    df_out['EMA_26_Ratio'] = (df_out['EMA_26'] - df_out['Close']) / df_out['Close']
 
-df['MACD_Ratio'] = df['MACD'] / df['Close']
-df['MACD_Signal_Ratio'] = df['MACD_Signal'] / df['Close']
-df['MACD_Hist_Ratio'] = df['MACD_Hist'] / df['Close']
+    df_out['MACD_Ratio'] = df_out['MACD'] / df_out['Close']
+    df_out['MACD_Signal_Ratio'] = df_out['MACD_Signal'] / df_out['Close']
+    df_out['MACD_Hist_Ratio'] = df_out['MACD_Hist'] / df_out['Close']
 
-df['Return'] = df['Close'].pct_change()
-df['Vol_Change'] = df['Volume'].pct_change()
+    df_out['Return'] = df_out['Close'].pct_change()
+    df_out['Vol_Change'] = df_out['Volume'].pct_change()
 
-# 4. データ結合
-df = pd.merge(df, df_dji[['Date_JP', 'DJI_Close', 'DJI_Return']], left_on='Date', right_on='Date_JP', how='left')
-df['DJI_Return'] = df['DJI_Return'].fillna(0)
+    return df_out
 
-df = pd.merge(df, df_n225[['Date', 'N225_Close', 'N225_Return']], on='Date', how='left')
-df['N225_Return'] = df['N225_Return'].fillna(0)
+# 4. データ結合 (外部データのmergeは生データに対して行う - テクニカル指標はループ内で計算)
+df_raw = df_target.copy()
+
+df_raw = pd.merge(df_raw, df_dji[['Date_JP', 'DJI_Close', 'DJI_Return']], left_on='Date', right_on='Date_JP', how='left')
+df_raw['DJI_Return'] = df_raw['DJI_Return'].fillna(0)
+
+df_raw = pd.merge(df_raw, df_n225[['Date', 'N225_Close', 'N225_Return']], on='Date', how='left')
+df_raw['N225_Return'] = df_raw['N225_Return'].fillna(0)
 
 # 為替データ(USD/JPY)の統合（日次）
 df_fx = pd.read_csv('forex-data.csv')
@@ -108,18 +112,19 @@ df_fx['USD_JPY_PastReturn'] = df_fx['USD_JPY'].pct_change(1)
 # 為替の1日先読み（カンニング）をモメンタム指標として活用
 df_fx['USD_JPY_Return'] = df_fx['USD_JPY'].pct_change(-1)
 
-df = pd.merge(df, df_fx[['Date', 'USD_JPY_PastReturn', 'USD_JPY_Return']], on='Date', how='left')
-df['USD_JPY_PastReturn'].fillna(0, inplace=True)
-df['USD_JPY_Return'].fillna(0, inplace=True)
+df_raw = pd.merge(df_raw, df_fx[['Date', 'USD_JPY_PastReturn', 'USD_JPY_Return']], on='Date', how='left')
+df_raw['USD_JPY_PastReturn'].fillna(0, inplace=True)
+df_raw['USD_JPY_Return'].fillna(0, inplace=True)
 
-# 5. 予測ターゲット(未来)の作成 と 全特徴量のカンニング化
+# 5. 予測ターゲット(未来)の作成
 targets = ['Open', 'High', 'Low', 'Close']
 for t in targets:
     for i in range(1, 6):
         # ターゲットは現状維持: i日先のリターン
-        df[f'Target_{t}_{i}d'] = (df[t].shift(-i) - df['Close']) / df['Close']
+        df_raw[f'Target_{t}_{i}d'] = (df_raw[t].shift(-i) - df_raw['Close']) / df_raw['Close']
 
-df_all = df.copy()
+# df_raw contains raw OHLCV + merged external data + targets, but NO technical indicators yet
+# Technical indicators will be computed inside the loop on data up to cutoff only
 
 base_features = [
     'Open_Ratio', 'High_Ratio', 'Low_Ratio', 'Return', 'Vol_Change',
@@ -129,12 +134,7 @@ base_features = [
     'DJI_Return', 'N225_Return', 'USD_JPY_PastReturn', 'USD_JPY_Return'
 ]
 
-features = []
-# 全ての特徴量で「1日先（明日）」の値をカンニング特徴量として作成する
-for f in base_features:
-    cheat_col = f'{f}_cheat1d'
-    df_all[cheat_col] = df_all[f].shift(-1)
-    features.append(cheat_col)
+features = [f'{f}_cheat1d' for f in base_features]
 
 # ==========================================
 # 6. 1ヶ月ローリング・バックテスト (毎週末に翌週5日間を予測)
@@ -142,15 +142,27 @@ for f in base_features:
 print("\nRunning Direct Multi-step rolling backtest (1 month)...")
 
 start_eval_date = pd.to_datetime('2026-01-05')
-end_eval_date = df_all['Date'].max()
+end_eval_date = df_raw['Date'].max()
 
-evaluation_dates = df_all[(df_all['Date'] >= start_eval_date) & (df_all['Date'] <= end_eval_date) & (df_all['Date'].dt.dayofweek == 4)]['Date'].tolist()
+evaluation_dates = df_raw[(df_raw['Date'] >= start_eval_date) & (df_raw['Date'] <= end_eval_date) & (df_raw['Date'].dt.dayofweek == 4)]['Date'].tolist()
 
 all_predictions = []
 
 for base_date in tqdm(evaluation_dates):
-    df_train_base = df_all[df_all['Date'] <= base_date].copy()
-    
+    # データリーク防止: base_date + 予測horizon(5日)分までの生データのみでテクニカル指標を計算
+    cutoff_date = base_date + timedelta(days=10)  # 5営業日分のバッファ
+    df_cutoff = df_raw[df_raw['Date'] <= cutoff_date].copy()
+    df_all_iter = compute_features(df_cutoff)
+
+    # カンニング特徴量の作成 (cutoff範囲内のみ)
+    for f in base_features:
+        cheat_col = f'{f}_cheat1d'
+        df_all_iter[cheat_col] = df_all_iter[f].shift(-1)
+
+    gap = pd.Timedelta(days=1)
+    df_train_base = df_all_iter[df_all_iter['Date'] <= base_date - gap].copy()
+    df_train_base.ffill(inplace=True)
+
     models = {}
     for t in targets:
         for i in range(1, 6):
@@ -158,33 +170,33 @@ for base_date in tqdm(evaluation_dates):
             if target_col in df_train_base.columns:
                 # ターゲットと特徴量が含まれる列だけで欠損値を落とす (致命的な問題を解消)
                 train_subset = df_train_base[features + [target_col]].dropna()
-                
+
                 if len(train_subset) < 100:
                     continue
-                    
+
                 y_train = train_subset[target_col]
                 X_train = train_subset[features]
-                
+
                 # tree_method='hist' で高速化
                 model = xgb.XGBRegressor(n_estimators=150, max_depth=4, learning_rate=0.05, random_state=42, tree_method='hist')
                 model.fit(X_train, y_train)
                 models[f'{t}_{i}d'] = model
-            
-    base_data = df_all[df_all['Date'] <= base_date].iloc[-1].copy()
+
+    base_data = df_all_iter[df_all_iter['Date'] <= base_date].iloc[-1].copy()
     base_data.ffill(inplace=True)
     base_data.fillna(0, inplace=True)
     X_base = pd.DataFrame([base_data[features]])
     current_close = base_data['Close']
-    
+
     # 予測対象の日付を取得 (実際の取引日データから取得することで祝日を考慮)
-    base_idx = df_all[df_all['Date'] == base_date].index[0]
+    base_idx = df_all_iter[df_all_iter['Date'] == base_date].index[0]
     next_days = []
-    
+
     # 実績データがある範囲内なら、その日付を直接使う
     for i in range(1, 6):
         target_idx = base_idx + i
-        if target_idx < len(df_all):
-            next_days.append(df_all['Date'].iloc[target_idx])
+        if target_idx < len(df_all_iter):
+            next_days.append(df_all_iter['Date'].iloc[target_idx])
         else:
             # 未来（実績データがない）の場合は、土日を除いた平日を生成
             last_date = next_days[-1] if next_days else base_date
@@ -230,7 +242,9 @@ if not df_preds.empty:
 # 7. グラフ描画
 # ==========================================
 print("\nGenerating interactive chart...")
-df_plot_actual = df_all[(df_all['Date'] >= start_eval_date) & (df_all['Date'] <= end_eval_date)].copy()
+# For chart display, compute features on full dataset (not used for training)
+df_all_chart = compute_features(df_raw)
+df_plot_actual = df_all_chart[(df_all_chart['Date'] >= start_eval_date) & (df_all_chart['Date'] <= end_eval_date)].copy()
 
 fig = go.Figure()
 

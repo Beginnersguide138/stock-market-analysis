@@ -56,6 +56,9 @@ df = pd.merge(df, df_weekly[['Week_Code', 'Sansan_Price', 'Stock_Return_1w']], o
 df = df.sort_values('Date').reset_index(drop=True)
 
 # 2. 特徴量エンジニアリング（ラグ特徴量）
+# NOTE: This script uses only lag features (shift(i) with i>0), so there is no data leakage
+# from future data in feature engineering. Lag features are computed on the full dataset
+# but only reference past values, which is safe.
 target_stock = 'Sansan_Price'
 # 使用するベース特徴量
 base_features = [c for c in df.columns if c not in ['Date', 'Week_Code', 'Sansan_Price']]
@@ -119,3 +122,22 @@ df_forecast = pd.DataFrame({
 
 print("\n=== より多くの特徴量を用いた今後8週間の予測結果 ===")
 print(df_forecast.to_string(index=False))
+
+# --- Cross Validation with TimeSeriesSplit ---
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+print("\n=== TimeSeriesSplit Cross-Validation (5-fold) ===")
+tscv = TimeSeriesSplit(n_splits=5)
+mae_scores = []
+rmse_scores = []
+for fold, (train_idx, val_idx) in enumerate(tscv.split(X), 1):
+    X_t, X_v = X.iloc[train_idx], X.iloc[val_idx]
+    y_t, y_v = y_stock.iloc[train_idx], y_stock.iloc[val_idx]
+    model_cv = xgb.XGBRegressor(n_estimators=100, max_depth=4, learning_rate=0.05, random_state=42)
+    model_cv.fit(X_t, y_t)
+    pred = model_cv.predict(X_v)
+    mae_scores.append(mean_absolute_error(y_v, pred))
+    rmse_scores.append(np.sqrt(mean_squared_error(y_v, pred)))
+    print(f"  Sansan_Price Fold {fold}: MAE={mae_scores[-1]:.4f}, RMSE={rmse_scores[-1]:.4f}")
+print(f"  Sansan_Price Avg MAE: {np.mean(mae_scores):.4f}, Avg RMSE: {np.mean(rmse_scores):.4f}")

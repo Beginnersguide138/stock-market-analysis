@@ -24,6 +24,7 @@ if isinstance(df_dji.columns, pd.MultiIndex):
 df_sansan = df_sansan.reset_index()
 df_dji = df_dji.reset_index()
 
+# Note: ffill applied before split for simplicity; minimal leakage risk for forward-fill
 df_sansan.ffill(inplace=True)
 df_dji.ffill(inplace=True)
 
@@ -34,27 +35,34 @@ df_dji['Date_JP'] = df_dji['Date'] + pd.Timedelta(days=1)
 df_dji['Date_JP'] = df_dji['Date_JP'].apply(lambda x: x + pd.Timedelta(days=2) if x.weekday() == 5 else (x + pd.Timedelta(days=1) if x.weekday() == 6 else x))
 
 # 3. テクニカル指標の計算 (Sansan)
-df = df_sansan.copy()
+def compute_technical_features(df_input):
+    """Compute technical indicators on the given dataframe to avoid data leakage.
+    Must be called on training data only (not on the full dataset before splitting)."""
+    df_out = df_input.copy()
+    ichi = IchimokuIndicator(high=df_out['High'], low=df_out['Low'], window1=9, window2=26, window3=52)
+    df_out['Ichi_Tenkan'] = ichi.ichimoku_conversion_line()
+    df_out['Ichi_Kijun'] = ichi.ichimoku_base_line()
+    df_out['Ichi_SpanA'] = ichi.ichimoku_a()
+    df_out['Ichi_SpanB'] = ichi.ichimoku_b()
+    df_out['Close_lag26'] = df_out['Close'].shift(26)
+    df_out['RSI'] = RSIIndicator(close=df_out['Close'], window=14).rsi()
+    macd = MACD(close=df_out['Close'])
+    df_out['MACD'] = macd.macd()
+    df_out['MACD_Signal'] = macd.macd_signal()
+    df_out['MACD_Hist'] = macd.macd_diff()
+    stoch = StochasticOscillator(high=df_out['High'], low=df_out['Low'], close=df_out['Close'], window=14, smooth_window=3)
+    df_out['Stoch_K'] = stoch.stoch()
+    df_out['Stoch_D'] = stoch.stoch_signal()
+    df_out['Return'] = df_out['Close'].pct_change()
+    df_out['Vol_Change'] = df_out['Volume'].pct_change()
+    return df_out
 
-ichi = IchimokuIndicator(high=df['High'], low=df['Low'], window1=9, window2=26, window3=52)
-df['Ichi_Tenkan'] = ichi.ichimoku_conversion_line()
-df['Ichi_Kijun'] = ichi.ichimoku_base_line()
-df['Ichi_SpanA'] = ichi.ichimoku_a()
-df['Ichi_SpanB'] = ichi.ichimoku_b()
-df['Close_lag26'] = df['Close'].shift(26)
-
-df['RSI'] = RSIIndicator(close=df['Close'], window=14).rsi()
-macd = MACD(close=df['Close'])
-df['MACD'] = macd.macd()
-df['MACD_Signal'] = macd.macd_signal()
-df['MACD_Hist'] = macd.macd_diff()
-
-stoch = StochasticOscillator(high=df['High'], low=df['Low'], close=df['Close'], window=14, smooth_window=3)
-df['Stoch_K'] = stoch.stoch()
-df['Stoch_D'] = stoch.stoch_signal()
-
-df['Return'] = df['Close'].pct_change()
-df['Vol_Change'] = df['Volume'].pct_change()
+# NOTE: For the main training path, this script trains on all available data and predicts
+# the next unseen point (no train/test split). Technical indicators used here (Ichimoku,
+# RSI, MACD, Stochastic) are backward-looking per row, so computing on the full dataset
+# does not leak future OHLCV values into any given row's features. The CV section below
+# recomputes features per fold to properly avoid leakage during evaluation.
+df = compute_technical_features(df_sansan)
 
 # 4. データ結合
 df = pd.merge(df, df_dji[['Date_JP', 'DJI_Close', 'DJI_Return']], left_on='Date', right_on='Date_JP', how='left')
@@ -76,28 +84,57 @@ X = df_train[features]
 y = df_train['Target_Close_1d']
 
 # 6. TimeSeriesSplit (時系列交差検証)
+# NOTE: Features are recomputed per fold on training data only to avoid data leakage.
 tscv = TimeSeriesSplit(n_splits=5)
 print("\n=== 時系列K-Fold交差検証 (TimeSeriesSplit) の実行 ===")
 
+# Prepare raw data with DJI merge but without technical indicators for CV
+df_raw_cv = df_sansan.copy()
+df_raw_cv = pd.merge(df_raw_cv, df_dji[['Date_JP', 'DJI_Close', 'DJI_Return']], left_on='Date', right_on='Date_JP', how='left')
+df_raw_cv['DJI_Return'] = df_raw_cv['DJI_Return'].fillna(0)
+df_raw_cv = df_raw_cv.dropna(subset=['Close']).reset_index(drop=True)
+
+BUFFER = 60
 mae_scores = []
 rmse_scores = []
+indices = np.arange(len(df_raw_cv))
 
-for fold, (train_index, test_index) in enumerate(tscv.split(X)):
-    X_train_fold, X_test_fold = X.iloc[train_index], X.iloc[test_index]
-    y_train_fold, y_test_fold = y.iloc[train_index], y.iloc[test_index]
-    
-    # 訓練
+for fold, (train_index, test_index) in enumerate(tscv.split(indices)):
+    buffer_start = max(0, train_index[0] - BUFFER)
+
+    # Recompute features on training portion only (with buffer for indicator warmup)
+    train_with_buffer = df_raw_cv.iloc[buffer_start:train_index[-1]+1]
+    train_featured = compute_technical_features(train_with_buffer)
+    train_featured['Target_Close_1d'] = train_featured['Close'].shift(-1)
+    train_featured = train_featured.dropna(subset=features + ['Target_Close_1d'])
+    actual_train_start = len(train_with_buffer) - len(train_index)
+    if actual_train_start > 0:
+        train_featured = train_featured.iloc[actual_train_start:]
+    X_train_fold = train_featured[features]
+    y_train_fold = train_featured['Target_Close_1d']
+
+    # Recompute features for validation (use train + val data, take val rows)
+    val_with_buffer = df_raw_cv.iloc[buffer_start:test_index[-1]+1]
+    val_featured = compute_technical_features(val_with_buffer)
+    val_featured['Target_Close_1d'] = val_featured['Close'].shift(-1)
+    val_featured = val_featured.dropna(subset=features + ['Target_Close_1d'])
+    val_featured = val_featured.iloc[-(len(test_index)):]
+    val_featured = val_featured.dropna(subset=features + ['Target_Close_1d'])
+    if len(val_featured) == 0 or len(X_train_fold) == 0:
+        continue
+    X_test_fold = val_featured[features]
+    y_test_fold = val_featured['Target_Close_1d']
+
     model = xgb.XGBRegressor(n_estimators=100, max_depth=3, learning_rate=0.05, random_state=42)
     model.fit(X_train_fold, y_train_fold)
-    
-    # 予測と評価
+
     preds = model.predict(X_test_fold)
     mae = mean_absolute_error(y_test_fold, preds)
     rmse = np.sqrt(mean_squared_error(y_test_fold, preds))
-    
+
     mae_scores.append(mae)
     rmse_scores.append(rmse)
-    
+
     print(f"Fold {fold+1}: MAE = {mae:.2f}円, RMSE = {rmse:.2f}円 (Train size: {len(X_train_fold)}, Test size: {len(X_test_fold)})")
 
 print(f"\nAverage MAE across folds: {np.mean(mae_scores):.2f}円")
