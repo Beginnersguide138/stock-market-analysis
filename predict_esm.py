@@ -19,6 +19,7 @@ if isinstance(df_dji.columns, pd.MultiIndex):
 
 df_sansan = df_sansan.reset_index()
 df_dji = df_dji.reset_index()
+# Note: ffill applied before split for simplicity; minimal leakage risk for forward-fill
 df_sansan.ffill(inplace=True)
 df_dji.ffill(inplace=True)
 
@@ -30,6 +31,10 @@ df_dji['Date_JP'] = df_dji['Date_JP'].apply(lambda x: x + pd.Timedelta(days=2) i
 df = df_sansan.copy()
 
 # モメンタムオシレータの計算
+# NOTE: RSI, Stochastic, and ROC are computed on the full dataset here. Since this script
+# uses Exponential Smoothing (not ML with train/test split) and applies oscillators only
+# as a heuristic correction to the latest data point, the leakage risk is minimal.
+# For a rigorous approach, compute these indicators only on data up to the prediction date.
 df['RSI'] = RSIIndicator(close=df['Close'], window=14).rsi()
 stoch = StochasticOscillator(high=df['High'], low=df['Low'], close=df['Close'], window=14, smooth_window=3)
 df['Stoch_K'] = stoch.stoch()
