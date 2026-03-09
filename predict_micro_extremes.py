@@ -11,16 +11,24 @@ import warnings
 warnings.filterwarnings('ignore')
 from joblib import Parallel, delayed
 import sys
+from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
+import jpholiday
 
 ticker = sys.argv[1] if len(sys.argv) > 1 else '4443.T'
+offset = int(sys.argv[2]) if len(sys.argv) > 2 else 2 # 2=yesterday, 3=day before yesterday, etc.
 
 # 1. データの取得 (日足)
-print(f"Fetching daily data for {ticker}, ^DJI, ^N225...")
+print(f"Fetching daily data for {ticker}, ^DJI, ^N225, ^VIX, and JP Indices...")
 df_target = yf.download(ticker, period='1y', progress=False)
 df_dji = yf.download('^DJI', period='1y', progress=False)
 df_n225 = yf.download('^N225', period='1y', progress=False)
+df_vix = yf.download('^VIX', period='1y', progress=False)
+# TOPIX
+df_topix = yf.download('1306.T', period='1y', progress=False) 
+# 東証マザーズコア/グロース市場250指数 Proxy
+df_growth = yf.download('2516.T', period='1y', progress=False)
 
-for df in [df_target, df_dji, df_n225]:
+for df in [df_target, df_dji, df_n225, df_vix, df_topix, df_growth]:
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     df.reset_index(inplace=True)
@@ -28,21 +36,34 @@ for df in [df_target, df_dji, df_n225]:
 
 df_dji['DJI_Close'] = df_dji['Close']
 df_dji['DJI_Return'] = df_dji['Close'].pct_change()
-df_dji['Date_JP'] = df_dji['Date'] + pd.Timedelta(days=1)
-df_dji['Date_JP'] = df_dji['Date_JP'].apply(lambda x: x + pd.Timedelta(days=2) if x.weekday() == 5 else (x + pd.Timedelta(days=1) if x.weekday() == 6 else x))
+# DJIとVIXは米国市場なので日付を1日ずらす
+for df_us in [df_dji, df_vix]:
+    df_us['Date_JP'] = df_us['Date'] + pd.Timedelta(days=1)
+    df_us['Date_JP'] = df_us['Date_JP'].apply(lambda x: x + pd.Timedelta(days=2) if x.weekday() == 5 else (x + pd.Timedelta(days=1) if x.weekday() == 6 else x))
 
-df_n225['N225_Close'] = df_n225['Close']
 df_n225['N225_Return'] = df_n225['Close'].pct_change()
+df_vix['VIX_Close'] = df_vix['Close']
+df_vix['VIX_Return'] = df_vix['Close'].pct_change()
+df_topix['TOPIX_Return'] = df_topix['Close'].pct_change()
+df_growth['Growth_Return'] = df_growth['Close'].pct_change()
 
-# 日付ベースの近似マージ（日足なので基本は完全一致に近い）
+# 日付ベースの近似マージ
 df_target['Date'] = pd.to_datetime(df_target['Date']).dt.tz_localize(None)
-df_dji['Date_JP'] = pd.to_datetime(df_dji['Date_JP']).dt.tz_localize(None)
-df_n225['Date'] = pd.to_datetime(df_n225['Date']).dt.tz_localize(None)
+for df_us in [df_dji, df_vix]:
+    df_us['Date_JP'] = pd.to_datetime(df_us['Date_JP']).dt.tz_localize(None)
+for df_jp in [df_n225, df_topix, df_growth]:
+    df_jp['Date'] = pd.to_datetime(df_jp['Date']).dt.tz_localize(None)
 
 df = pd.merge(df_target, df_dji[['Date_JP', 'DJI_Return']], left_on='Date', right_on='Date_JP', how='left')
-df['DJI_Return'] = df['DJI_Return'].fillna(0)
+df = pd.merge(df, df_vix[['Date_JP', 'VIX_Close', 'VIX_Return']], left_on='Date', right_on='Date_JP', how='left', suffixes=('', '_vix'))
+for col in ['DJI_Return', 'VIX_Close', 'VIX_Return']:
+    df[col] = df[col].ffill().fillna(0)
+
 df = pd.merge(df, df_n225[['Date', 'N225_Return']], on='Date', how='left')
-df['N225_Return'] = df['N225_Return'].fillna(0)
+df = pd.merge(df, df_topix[['Date', 'TOPIX_Return']], on='Date', how='left')
+df = pd.merge(df, df_growth[['Date', 'Growth_Return']], on='Date', how='left')
+for col in ['N225_Return', 'TOPIX_Return', 'Growth_Return']:
+    df[col] = df[col].fillna(0)
 
 # 為替データ
 try:
@@ -50,11 +71,12 @@ try:
     df_fx = df_fx[df_fx['日付'] != '日付'].dropna(subset=['日付'])
     df_fx['Date'] = pd.to_datetime(df_fx['日付'], format='%y/%m/%d')
     df_fx['USD_JPY'] = pd.to_numeric(df_fx['終値'], errors='coerce')
-    df_fx['USD_JPY_Return'] = df_fx['USD_JPY'].pct_change(-1)
-    df = pd.merge(df, df_fx[['Date', 'USD_JPY_Return']], on='Date', how='left')
-    df['USD_JPY_Return'] = df['USD_JPY_Return'].fillna(0)
+    # 意図的なリーク: 1日先の未来の為替変動率を特徴量として使用する
+    df_fx['USD_JPY_Return_1d_ahead'] = df_fx['USD_JPY'].pct_change(-1)
+    df = pd.merge(df, df_fx[['Date', 'USD_JPY_Return_1d_ahead']], on='Date', how='left')
+    df['USD_JPY_Return_1d_ahead'] = df['USD_JPY_Return_1d_ahead'].fillna(0)
 except FileNotFoundError:
-    df['USD_JPY_Return'] = 0.0
+    df['USD_JPY_Return_1d_ahead'] = 0.0
 
 # 2. 特徴量の計算 (ボラティリティとヒゲ特化)
 print("Calculating advanced micro features...")
@@ -90,6 +112,9 @@ df['MACD_Ratio'] = macd.macd() / df['Close']
 df['MACD_Hist_Ratio'] = macd.macd_diff() / df['Close']
 df['Vol_Change'] = df['Volume'].pct_change()
 
+# 曜日情報 (0: 月曜, 4: 金曜)
+df['Day_of_Week'] = df['Date'].dt.dayofweek
+
 # 3. 予測ターゲットの設定 (高値と安値に特化)
 # ターゲット: 当日の始値を基準とした、High/Lowの乖離率を予測する
 # これにより、「終値は変わらなくても、日中どれくらい暴れるか」を直接学習させる
@@ -107,7 +132,8 @@ base_features = [
     'ATR_Ratio', 'BB_Width_Ratio', 'BB_Pos',
     'Upper_Shadow_Ratio', 'Lower_Shadow_Ratio',
     'Upper_Shadow_5d_MA', 'Lower_Shadow_5d_MA',
-    'DJI_Return', 'N225_Return', 'USD_JPY_Return'
+    'DJI_Return', 'N225_Return', 'USD_JPY_Return_1d_ahead',
+    'VIX_Close', 'VIX_Return', 'TOPIX_Return', 'Growth_Return', 'Day_of_Week'
 ]
 
 df = df.replace([np.inf, -np.inf], np.nan)
@@ -120,41 +146,54 @@ df_train = df.dropna(subset=base_features + [f'Target_High_{i}d' for i in range(
 X_train = df_train[base_features]
 
 models = {}
+# TimeSeriesSplit for temporal cross-validation
+tscv = TimeSeriesSplit(n_splits=3)
+
+# Grid for tuning
+param_grid = {
+    'max_depth': [3, 5, 7],
+    'learning_rate': [0.01, 0.05, 0.1],
+    'n_estimators': [100, 200]
+}
+
+print("Running Hyperparameter Tuning with GridSearchCV...")
+
 for i in range(1, 6):
     # --- 1. 高値 (High) 用モデル: 楽観的シナリオ (上振れ極値) ---
     y_high = df_train[f'Target_High_{i}d']
-    model_high = xgb.XGBRegressor(
+    base_high = xgb.XGBRegressor(
         objective='reg:quantileerror',
-        quantile_alpha=0.90, # 90%分位点 (上ヒゲの先端付近を狙う)
-        n_estimators=150, max_depth=3, learning_rate=0.05, 
+        quantile_alpha=0.90,
         random_state=42, tree_method='hist'
     )
-    model_high.fit(X_train, y_high)
-    models[f'High_{i}d'] = model_high
+    grid_high = GridSearchCV(estimator=base_high, param_grid=param_grid, cv=tscv, scoring='neg_mean_absolute_error', n_jobs=-1)
+    grid_high.fit(X_train, y_high)
+    models[f'High_{i}d'] = grid_high.best_estimator_
     
     # --- 2. 安値 (Low) 用モデル: 悲観的シナリオ (下振れ極値) ---
     y_low = df_train[f'Target_Low_{i}d']
-    model_low = xgb.XGBRegressor(
+    base_low = xgb.XGBRegressor(
         objective='reg:quantileerror',
-        quantile_alpha=0.10, # 10%分位点 (下ヒゲの先端付近を狙う)
-        n_estimators=150, max_depth=3, learning_rate=0.05, 
+        quantile_alpha=0.10,
         random_state=42, tree_method='hist'
     )
-    model_low.fit(X_train, y_low)
-    models[f'Low_{i}d'] = model_low
+    grid_low = GridSearchCV(estimator=base_low, param_grid=param_grid, cv=tscv, scoring='neg_mean_absolute_error', n_jobs=-1)
+    grid_low.fit(X_train, y_low)
+    models[f'Low_{i}d'] = grid_low.best_estimator_
     
     # --- 3. 基準となる始値ギャップ (Open Gap) の予測 (平均的な回帰) ---
     y_open_gap = df_train[f'Target_Open_Gap_{i}d']
-    model_open = xgb.XGBRegressor(
-        objective='reg:squarederror', # Openは平均値を狙う
-        n_estimators=100, max_depth=3, learning_rate=0.05, 
+    base_open = xgb.XGBRegressor(
+        objective='reg:squarederror',
         random_state=42, tree_method='hist'
     )
-    model_open.fit(X_train, y_open_gap)
-    models[f'Open_Gap_{i}d'] = model_open
+    grid_open = GridSearchCV(estimator=base_open, param_grid=param_grid, cv=tscv, scoring='neg_mean_squared_error', n_jobs=-1)
+    grid_open.fit(X_train, y_open_gap)
+    models[f'Open_Gap_{i}d'] = grid_open.best_estimator_
 
 # 最新データでの推論
-last_row = df.iloc[-1].copy()
+# 意図的な1日先のリーク(今日の為替)を活用するため、昨日のデータ(iloc[-2])を起点として今日〜4日後を予測する
+last_row = df.iloc[-offset].copy()
 last_row.fillna(0, inplace=True)
 X_pred = pd.DataFrame([last_row[base_features]])
 
@@ -167,12 +206,12 @@ predictions = []
 # シミュレーションのための基準値トラッキング
 prev_close = current_close
 
-# 日付リストの作成 (土日スキップ)
+# 日付リストの作成 (土日と日本の祝日をスキップ)
 next_days = []
 tmp_date = last_date
 while len(next_days) < 5:
     tmp_date += timedelta(days=1)
-    if tmp_date.weekday() < 5:
+    if tmp_date.weekday() < 5 and not jpholiday.is_holiday(tmp_date):
         next_days.append(tmp_date)
 
 for idx, target_date in enumerate(next_days):
@@ -220,12 +259,12 @@ print(df_preds[['Date', 'Day', 'Pred_Low', 'Pred_Open', 'Pred_High', 'Max_Volati
 # グラフ描画
 fig = go.Figure()
 
-df_plot = df.tail(20)
+df_plot = df.tail(20 + offset)
 fig.add_trace(go.Candlestick(
     x=df_plot['Date'],
     open=df_plot['Open'], high=df_plot['High'],
     low=df_plot['Low'], close=df_plot['Close'],
-    name='Actual (過去20日)',
+    name=f'Actual (過去{20+offset}日)',
     increasing_line_color='black', decreasing_line_color='black',
     increasing_fillcolor='white', decreasing_fillcolor='black'
 ))
