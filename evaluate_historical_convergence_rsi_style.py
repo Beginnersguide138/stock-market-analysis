@@ -111,6 +111,10 @@ param_grid = {'max_depth': [3], 'learning_rate': [0.05], 'n_estimators': [100]}
 
 print(f"\nRunning Recent 1-Year Historical Rolling Simulation for {len(test_indices)} trading days...")
 
+# Ensure we also run the prediction for the VERY LAST available row to get true future predictions
+if test_indices[-1] < len(df) - 1:
+    test_indices.append(len(df) - 1)
+
 for current_idx in tqdm(test_indices):
     df_train_full = df.iloc[:current_idx+1].copy()
     df_train = df_train_full.iloc[-250:].dropna(subset=base_features + [f'Target_High_{i}d' for i in range(1,6)] + [f'Target_Low_{i}d' for i in range(1,6)])
@@ -220,7 +224,7 @@ fig.add_trace(go.Candlestick(
 
 for tgt in unique_targets:
     preds = df_preds[df_preds['Target_Date'] == tgt]
-    if len(preds) > 0 and pd.to_datetime(TEST_START_DATE) <= tgt <= pd.to_datetime(TEST_END_DATE):
+    if len(preds) > 0 and pd.to_datetime(TEST_START_DATE) <= tgt <= pd.to_datetime(TEST_END_DATE) + pd.Timedelta(days=15):
         fig.add_trace(go.Box(
             x=preds['Target_Date'], y=preds['Pred_High'],
             name='High Convergence', marker_color='rgba(255, 0, 0, 0.6)', 
@@ -234,7 +238,8 @@ for tgt in unique_targets:
         ), row=1, col=1)
 
 if not df_conv.empty:
-    df_conv_plot = df_conv[(df_conv['Target_Date'] >= pd.to_datetime(TEST_START_DATE)) & (df_conv['Target_Date'] <= pd.to_datetime(TEST_END_DATE))]
+    # Filter scores to the test range + future days
+    df_conv_plot = df_conv[(df_conv['Target_Date'] >= pd.to_datetime(TEST_START_DATE)) & (df_conv['Target_Date'] <= pd.to_datetime(TEST_END_DATE) + pd.Timedelta(days=15))]
     
     # Plot as a continuous line like RSI instead of bars
     fig.add_trace(go.Scatter(
